@@ -1,0 +1,259 @@
+---
+title: "blizzardassign"
+output: html_document
+date: "2024-12-20"
+---
+
+Table of Contents:
+1. Establish connection to database in PostGreSQL via RStudio
+2. Upload raw datasets into RStudio
+3. Store datasets into PostGreSQL tables
+4. Create intermediate datasets: dim_customer, dim_product, fact_sales
+5. Create final dataset: sales_performance
+
+```{r}
+install.packages("DBI")
+install.packages("RPostgres")
+
+```
+
+1. Establish connection to database via RStudio
+
+```{r}
+library(DBI)
+library(RPostgres)
+
+# Connection parameters
+host <- "localhost"          # server address
+port <- 5432                 # PostgreSQL port
+dbname <- "blizzardtest"    # database name
+user <- "postgres"      # PostgreSQL username
+password <- "twixrocks"  # PostgreSQL password
+
+# Establish connection
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = host,
+  port = port,
+  dbname = dbname,
+  user = user,
+  password = password
+)
+```
+
+
+2. Upload raw datasets into RStudio
+
+```{r}
+# upload csv dataset
+orders <- read.csv("/Users/Shared/orders.csv", fileEncoding="UTF-16LE")
+products <- read.csv("/Users/Shared/products.csv",fileEncoding="UTF-16LE")
+customers <- read.csv("/Users/Shared/customers.csv",fileEncoding="UTF-16LE")
+
+# convert back to numeric and date columns - were uploaded into R as character
+orders$total_amount <- as.numeric(orders$total_amount)
+orders$order_date <- as.Date(orders$order_date) # converts invalid dates to NA (ex: february 30th)
+```
+
+3. Store datasets into PostGreSQL tables
+
+```{r}
+# upload data into database
+datasets <- list(customers = customers, products = products, orders = orders)
+dataset_names <- c("customers", "products", "orders")
+
+# get maximum memory required for allocation of CUSTOMERS variables 
+max_customer_id <- max(nchar(customers$customer_id), na.rm = TRUE)
+max_customer_name <- max(nchar(customers$customer_name), na.rm = TRUE)
+max_region <- max(nchar(customers$region), na.rm = TRUE)
+max_segment <- max(nchar(customers$segment), na.rm = TRUE)
+
+# query to create initial CUSTOMERS table
+create_table_query <- paste0("CREATE TABLE customers(
+                      customer_id VARCHAR(", max_customer_id, ") PRIMARY KEY,
+                      customer_name VARCHAR(", max_customer_name, "),
+                      region VARCHAR(", max_region, "),
+                      segment VARCHAR(", max_segment, "),
+                      irrelevant_col_1 VARCHAR(50),
+                      irrelevant_col_2 VARCHAR(50),
+                      irrelevant_col_3 VARCHAR(50))")
+dbExecute(con, create_table_query)
+
+# get maximum memory required for allocation of PRODUCTS variables
+max_product_id <- max(nchar(products$product_id), na.rm = TRUE)
+max_product_name <- max(nchar(products$product_name), na.rm = TRUE)
+max_category <- max(nchar(products$category), na.rm = TRUE)
+
+# query to create initial PRODUCTS table
+create_table_query <- paste0("CREATE TABLE products(
+                      product_id VARCHAR(", max_product_id, ") PRIMARY KEY,
+                      product_name VARCHAR(", max_product_name, "),
+                      category VARCHAR(", max_category, "),
+                      irrelevant_col_1 VARCHAR(50),
+                      irrelevant_col_2 VARCHAR(50),
+                      irrelevant_col_3 VARCHAR(50))")
+dbExecute(con, create_table_query)
+
+# get maximum memory required for allocation of ORDERS variables
+max_customer_id2 <- max(nchar(orders$customer_id), na.rm = TRUE)
+max_product_id2 <- max(nchar(orders$product_id), na.rm = TRUE)
+max_order_id <- max(nchar(orders$order_id), na.rm = TRUE)
+max_total_amount <- max(nchar(as.character(orders$total_amount)), na.rm = TRUE) 
+
+# query to create initial ORDERS table
+create_table_query <- paste0("CREATE TABLE orders(
+                      order_id VARCHAR(", max_order_id, ") PRIMARY KEY,
+                      customer_id VARCHAR(", max_customer_id2, "),
+                      order_date DATE,
+                      total_amount NUMERIC(", max_total_amount, ", 2),
+                      product_id VARCHAR(", max_product_id2, "),
+                      irrelevant_col_1 VARCHAR(50),
+                      irrelevant_col_2 VARCHAR(50),
+                      irrelevant_col_3 VARCHAR(50))")
+dbExecute(con, create_table_query)
+
+
+# upload datasets into SQL tables
+for (d in 1:length(datasets)){
+  
+  # note: csv import doesn't enforce constraints
+  dbWriteTable(
+    con,
+    name = dataset_names[[d]],  
+    value = datasets[[d]],
+    row.names = FALSE,       
+    overwrite = TRUE
+  )
+}
+```
+
+4. Create intermediate datasets
+
+a) dim_customer
+```{r}
+# create dim_customer table
+### setting customer_id as primary key will result in error if trying to upload duplicate customer ID
+### set memory as maximum length found in column within dataset
+create_table_query <- paste0("CREATE TABLE dim_customer(
+                      customer_id VARCHAR(", max_customer_id, ") PRIMARY KEY,
+                      customer_name VARCHAR(", max_customer_name, "),
+                      region VARCHAR(", max_region, "),
+                      segment VARCHAR(", max_segment, "))")
+dbExecute(con, create_table_query)
+
+# insert data into dim_customer
+### de-duplicate customer IDs by adding primary key constraint
+### remove all white space from customer_id, and remove trailing/leading spaces for remaining varchar variables
+### convert all varchar variables to uppercase for consistency
+### remove empty/null customer_ids or those equal to NA
+### remove duplicate rows, although they shouldn't appear
+### set region to NULL if not in N/E/S/W
+create_table_query <- "INSERT INTO dim_customer
+                      SELECT DISTINCT NULLIF(UPPER(REPLACE(customer_id, ' ', '')), '') AS customer_id, 
+                      TRIM(UPPER(customer_name)) AS customer_name, 
+                      CASE 
+                          WHEN TRIM(UPPER(region))  NOT IN ('NORTH', 'EAST', 'SOUTH', 'WEST') THEN NULL
+                          ELSE TRIM(UPPER(region)) 
+                      END AS region,
+                      TRIM(UPPER(segment)) AS segment
+                      FROM customers
+                      WHERE NULLIF(UPPER(REPLACE(customer_id, ' ', '')), '') != 'N/A' AND NULLIF(UPPER(REPLACE(customer_id, ' ', '')), '') IS NOT NULL"
+dbExecute(con, create_table_query)
+```
+
+b) dim_product
+```{r}
+# create dim_product table
+### setting product_id as primary key will result in error if trying to upload duplicate product ID
+### set memory as maximum length found in column within dataset
+create_table_query <- paste0("CREATE TABLE dim_product(
+                      product_id VARCHAR(", max_product_id, ") PRIMARY KEY,
+                      product_name VARCHAR(", max_product_name, "),
+                      category VARCHAR(", max_category, "))")
+dbExecute(con, create_table_query)
+
+# insert data into dim_product
+### de-duplicate product IDs by adding primary key constraint
+### remove all white space from product_id, and remove trailing/leading spaces for remaining varchar variables
+### convert all varchar variables to uppercase for consistency
+### remove empty/null product_ids or those equal to NA
+### remove duplicate rows, although they shouldn't appear
+create_table_query <- "INSERT INTO dim_product
+                      SELECT DISTINCT NULLIF(UPPER(REPLACE(product_id, ' ', '')), '') AS product_id, 
+                      TRIM(UPPER(product_name)) AS product_name, 
+                      TRIM(UPPER(category)) AS category
+                      FROM products
+                      WHERE NULLIF(UPPER(REPLACE(product_id, ' ', '')), '') != 'N/A' AND NULLIF(UPPER(REPLACE(product_id, ' ', '')), '') IS NOT NULL"
+dbExecute(con, create_table_query)
+```
+
+c) fact_sales
+```{r}
+# create fact_sales
+### setting product_id as primary key will result in error if trying to upload duplicate product ID
+### set memory as maximum length found in column within dataset; want 2 decimal places for total_amount
+create_table_query <- paste0("CREATE TABLE fact_sales(
+                      order_id VARCHAR(", max_order_id, ") PRIMARY KEY,
+                      customer_id VARCHAR(", max_customer_id2, "),
+                      order_date DATE,
+                      total_amount NUMERIC(", max_total_amount, ", 2),
+                      product_id VARCHAR(", max_product_id2, "),
+                      customer_name VARCHAR(", max_customer_name, "),
+                      region VARCHAR(", max_region, "),
+                      segment VARCHAR(", max_segment, "),
+                      product_name VARCHAR(", max_product_name, "),
+                      category VARCHAR(", max_category, "))")
+dbExecute(con, create_table_query)
+
+# insert data into fact_sales
+### replace varchar variables with NULL if they are empty after removing all whitespace (most done in prev tables)
+### if total_amount is NULL then set to 0
+### remove duplicate rows, although they shouldn't appear
+### invalid dates are set to NULL/NA already, so no adjustment here
+create_table_query <- "INSERT INTO fact_sales
+                      SELECT DISTINCT NULLIF(UPPER(REPLACE(aa.order_id, ' ', '')), '') AS order_id,
+                      NULLIF(UPPER(REPLACE(aa.customer_id, ' ', '')), '') AS customer_id, 
+                      aa.order_date, 
+                      COALESCE(aa.total_amount, 0) AS total_amount,
+                      NULLIF(UPPER(REPLACE(aa.product_id, ' ', '')), '') AS product_id,
+                      NULLIF(bb.customer_name, '') AS customer_name,
+                      NULLIF(bb.region, '') AS region,
+                      NULLIF(bb.segment,'') AS segment,
+                      NULLIF(cc.product_name, '') AS product_name,
+                      NULLIF(cc.category, '') AS category
+                      FROM orders AS aa
+                      LEFT JOIN dim_customer AS bb
+                      ON NULLIF(UPPER(REPLACE(aa.customer_id, ' ', '')), '') = bb.customer_id
+                      LEFT JOIN dim_product AS cc
+                      ON NULLIF(UPPER(REPLACE(aa.product_id, ' ', '')), '') = cc.product_id
+                      WHERE NULLIF(UPPER(REPLACE(aa.order_id, ' ', '')), '') != 'N/A' AND NULLIF(UPPER(REPLACE(aa.order_id, ' ', '')), '') IS NOT NULL"
+dbExecute(con, create_table_query)
+```
+
+5. Create final dataset, sales_performance
+
+```{r}
+# each row is the amount of money an individual customer (determined by customer_id) spent within a month on a certain product
+create_table_query <- "CREATE TABLE sales_performance AS
+                       SELECT customer_name, 
+                       region, 
+                       segment, 
+                       product_name, 
+                       category, 
+                       EXTRACT(MONTH FROM order_date) AS month, 
+                       SUM(total_amount) AS total_revenue
+                       FROM fact_sales
+                       GROUP BY month, customer_id, customer_name, region, segment, product_name, category
+                       ORDER BY month DESC NULLS LAST, total_revenue DESC "
+dbExecute(con, create_table_query)
+```
+
+```{r}
+query <- "SELECT * FROM sales_performance"
+result <- dbGetQuery(con, query)
+result
+```
+
+
+
+
